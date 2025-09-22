@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Asteroids – HTML5 Canvas</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#0b0f14; color:#d7e0ea; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
+    #ui { position: fixed; inset: 0; pointer-events: none; display:flex; align-items:flex-start; justify-content:space-between; padding: 16px; }
+    .panel { backdrop-filter: blur(8px); background: rgba(10,14,20,0.35); border:1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,0.35); }
+    #score { font-weight:700; letter-spacing:0.5px }
+    #help { font-size: 13px; line-height:1.4 }
+    canvas { display:block; width:100vw; height:100vh; }
+    #center { position:fixed; inset:0; display:grid; place-items:center; }
+    #center .panel { text-align:center; padding:20px 24px; pointer-events:auto; }
+    kbd { pointer-events:none; border:1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); border-bottom-width:2px; border-radius:6px; padding:1px 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+    .muted { color:#9fb1c3 }
+    .btns { display:flex; gap:8px; justify-content:center; margin-top:10px }
+    button { pointer-events:auto; cursor:pointer; border-radius:10px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.06); color:#d7e0ea; padding:8px 12px; font-weight:600 }
+    button[aria-pressed="true"] { outline:2px solid #8fb3ff; background:rgba(143,179,255,0.15) }
+    .tag { display:inline-block; border:1px solid rgba(255,255,255,0.15); padding:2px 8px; border-radius:12px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="ui">
+    <div class="panel" id="score">Score: 0 &nbsp; • &nbsp; Liv: <span id="lives">3</span> &nbsp; • &nbsp; Niveau: <span id="level">1</span> &nbsp; • &nbsp; <span class="tag">Svær: <span id="diffTag">Normal</span></span> &nbsp; • &nbsp; <span class="tag">Lyd: <span id="soundTag">Fra</span></span> &nbsp; • &nbsp; <span class="tag">I-cd: <span id="icdTag">0s</span></span></div>
+    <div class="panel" id="help">
+      <div><strong>Styring</strong></div>
+      <div><kbd>←</kbd> / <kbd>→</kbd> drej &nbsp; <kbd>↑</kbd> thrust &nbsp; <kbd>Space</kbd> skyd &nbsp; <kbd>Enter</kbd> start/genstart &nbsp; <kbd>M</kbd> mute &nbsp; <kbd>I</kbd> 2s uovervindelig (med cooldown)</div>
+      <div class="muted">Lyd starter efter første tastetryk/klik (browserpolitik). Wrap er aktiv (kanterne). </div>
+    </div>
+  </div>
+  <div id="center"></div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const diffTag = document.getElementById('diffTag');
+  const soundTag = document.getElementById('soundTag');
+  const icdTag = document.getElementById('icdTag');
+  const centerEl = document.getElementById('center');
+
+  const TAU = Math.PI * 2;
+  const rand = (min, max) => Math.random() * (max - min) + min;
+  const wrap = (obj, w, h) => {
+    if (obj.pos.x < -obj.radius) obj.pos.x = w + obj.radius;
+    if (obj.pos.x > w + obj.radius) obj.pos.x = -obj.radius;
+    if (obj.pos.y < -obj.radius) obj.pos.y = h + obj.radius;
+    if (obj.pos.y > h + obj.radius) obj.pos.y = -obj.radius;
+  };
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    canvas.style.width = '100vw';
+    canvas.style.height = '100vh';
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  addEventListener('resize', resize, { passive:true });
+  resize();
+
+  // --- Timing util (robust perf.now polyfill) ---
+  const perf = (() => {
+    const hasPerf = typeof performance !== 'undefined' && performance && typeof performance.now === 'function';
+    const origin = hasPerf ? (performance.timeOrigin || (Date.now() - performance.now())) : Date.now();
+    let last = 0;
+    return {
+      now(){
+        const t = hasPerf ? performance.now() : (Date.now() - origin);
+        // Sikr ikke-faldende tid i edge-sandboxes
+        if (t >= last) last = t;
+        return last;
+      }
+    };
+  })();
+
+  // --- Lyd (WebAudio) ---
+  let audioCtx = null, muted = false;
+  function ensureAudio(){ if (!audioCtx) { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); updateSoundTag(); } }
+  function beep({ type='square', freq=440, dur=0.08, vol=0.2, attack=0.005, release=0.08, pitchDecay=0 }){
+    if (!audioCtx || muted) return;
+    const t0 = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type; osc.frequency.setValueAtTime(freq, t0);
+    if (pitchDecay){ osc.frequency.exponentialRampToValueAtTime(Math.max(40, freq*pitchDecay), t0+dur); }
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0+attack);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0+dur+release);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t0); osc.stop(t0+dur+release+0.02);
+  }
+  const sfx = {
+    shoot(){ beep({ type:'square', freq:900, dur:0.06, vol:0.18, pitchDecay:0.35 }); },
+    // Lagdelt eksplosion
+    explode(power=1){
+      if (!audioCtx || muted) return;
+      const t0 = audioCtx.currentTime;
+      const boom = audioCtx.createOscillator();
+      const boomGain = audioCtx.createGain();
+      boom.type = 'sine';
+      const f0 = 220 * Math.min(1.5, 0.7 + power*0.5);
+      boom.frequency.setValueAtTime(f0, t0);
+      boom.frequency.exponentialRampToValueAtTime(Math.max(40, f0*0.25), t0 + 0.25);
+      boomGain.gain.setValueAtTime(0.0001, t0);
+      boomGain.gain.linearRampToValueAtTime(0.35*Math.min(1, 0.6+0.3*power), t0+0.01);
+      boomGain.gain.exponentialRampToValueAtTime(0.0001, t0+0.35);
+      boom.connect(boomGain).connect(audioCtx.destination);
+      boom.start(t0); boom.stop(t0+0.36);
+      const tone = audioCtx.createOscillator();
+      const toneGain = audioCtx.createGain();
+      tone.type = 'sawtooth';
+      const tf0 = 500 * Math.min(2, 0.8 + power*0.6);
+      tone.frequency.setValueAtTime(tf0, t0);
+      tone.frequency.exponentialRampToValueAtTime(Math.max(80, tf0*0.25), t0+0.22);
+      toneGain.gain.setValueAtTime(0.0001, t0);
+      toneGain.gain.linearRampToValueAtTime(0.18, t0+0.01);
+      toneGain.gain.exponentialRampToValueAtTime(0.0001, t0+0.24);
+      tone.connect(toneGain).connect(audioCtx.destination);
+      tone.start(t0); tone.stop(t0+0.25);
+      const noiseBuf = audioCtx.createBuffer(1, Math.floor(0.3*audioCtx.sampleRate), audioCtx.sampleRate);
+      const data = noiseBuf.getChannelData(0);
+      for (let i=0;i<data.length;i++) data[i] = (Math.random()*2-1) * (1 - i/data.length);
+      const noise = audioCtx.createBufferSource();
+      noise.buffer = noiseBuf; noise.loop = false;
+      const bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(1000 + power*400, t0); bp.Q.value = 0.8;
+      const nGain = audioCtx.createGain();
+      nGain.gain.setValueAtTime(0.0001, t0);
+      nGain.gain.linearRampToValueAtTime(0.28*Math.min(1, 0.6+0.4*power), t0+0.005);
+      nGain.gain.exponentialRampToValueAtTime(0.0001, t0+0.22);
+      noise.connect(bp).connect(nGain).connect(audioCtx.destination);
+      noise.start(t0); noise.stop(t0+0.25);
+    },
+    thrust(){ beep({ type:'triangle', freq:120, dur:0.04, vol:0.12 }); },
+    level(){ beep({ type:'triangle', freq:700, dur:0.15, vol:0.2 }); beep({ type:'triangle', freq:1000, dur:0.12, vol:0.2, attack:0.005, release:0.05 }); },
+    over(){ beep({ type:'sawtooth', freq:220, dur:0.25, vol:0.25 }); beep({ type:'triangle', freq:110, dur:0.3, vol:0.2 }); },
+    inv(){ beep({ type:'triangle', freq:1200, dur:0.08, vol:0.18 }); beep({ type:'triangle', freq:1600, dur:0.08, vol:0.18 }); }
+  };
+  function updateSoundTag(){ soundTag.textContent = (!audioCtx || muted) ? 'Fra' : 'Til'; }
+
+  // --- Sværhedsgrader ---
+  const DIFFS = {
+    Easy:   { lives:5, asteroidSpeed:0.85, spawnStart:4, spawnPerLevel:3, bulletCooldown:140 },
+    Normal: { lives:3, asteroidSpeed:1.00, spawnStart:5, spawnPerLevel:4, bulletCooldown:180 },
+    Hard:   { lives:2, asteroidSpeed:1.20, spawnStart:6, spawnPerLevel:5, bulletCooldown:220 }
+  };
+  let currentDiffName = 'Normal';
+  let currentDiff = DIFFS[currentDiffName];
+
+  class Vec2 { constructor(x=0,y=0){ this.x=x; this.y=y; } add(v){ this.x+=v.x; this.y+=v.y; return this } scale(s){ this.x*=s; this.y*=s; return this } clone(){ return new Vec2(this.x,this.y) } }
+
+  class Ship {
+    constructor(){ this.pos=new Vec2(canvas.width/2, canvas.height/2); this.vel=new Vec2(0,0); this.angle=-Math.PI/2; this.radius=12; this.cooldown=0; this.invincible=1800; }
+    update(dt, input){
+      const ROT=0.005, THRUST=0.00035, FRICTION=0.00025;
+      if (input.left) this.angle -= ROT*dt;
+      if (input.right) this.angle += ROT*dt;
+      if (input.up){ this.vel.x += Math.cos(this.angle)*THRUST*dt; this.vel.y += Math.sin(this.angle)*THRUST*dt; particles.thrust(this); sfx.thrust(); }
+      this.vel.scale(1 - FRICTION*dt); this.pos.add(this.vel.clone().scale(dt)); wrap(this, canvas.width, canvas.height);
+      if (this.cooldown>0) this.cooldown -= dt; if (this.invincible>0) this.invincible -= dt;
+    }
+    draw(){ ctx.save(); ctx.translate(this.pos.x,this.pos.y); ctx.rotate(this.angle+Math.PI/2); const blink=this.invincible>0 && Math.floor(perf.now()/100)%2===0; ctx.globalAlpha=blink?0.4:1; ctx.beginPath(); ctx.moveTo(0,-14); ctx.lineTo(9,10); ctx.lineTo(-9,10); ctx.closePath(); ctx.strokeStyle='#d7e0ea'; ctx.lineWidth=2; ctx.stroke(); ctx.restore(); }
+    canShoot(){ return this.cooldown<=0 }
+    shoot(){ this.cooldown = currentDiff.bulletCooldown; }
+  }
+
+  class Bullet{ constructor(x,y,angle){ this.pos=new Vec2(x,y); const SPEED=0.7; this.vel=new Vec2(Math.cos(angle)*SPEED, Math.sin(angle)*SPEED); this.life=1200; this.radius=2; } update(dt){ this.pos.add(this.vel.clone().scale(dt)); this.life-=dt; wrap(this, canvas.width, canvas.height);} alive(){ return this.life>0 } draw(){ ctx.beginPath(); ctx.arc(this.pos.x,this.pos.y,2,0,TAU); ctx.fillStyle='#e8f1fa'; ctx.fill(); } }
+
+  class Asteroid{ constructor(x,y,size=3){ this.pos=new Vec2(x,y); const a=rand(0,TAU); const BASE={3:0.06,2:0.09,1:0.13}[size]; const SPEED=BASE*currentDiff.asteroidSpeed; this.vel=new Vec2(Math.cos(a)*SPEED, Math.sin(a)*SPEED); this.size=size; this.radius={3:46,2:28,1:16}[size]; const verts=12; this.shape=Array.from({length:verts},(_,i)=>{ const ang=i/verts*TAU+rand(-0.1,0.1); const r=this.radius*rand(0.75,1.15); return {x:Math.cos(ang)*r,y:Math.sin(ang)*r}; }); this.rotation=rand(-0.0006,0.0006); this.angle=0; } update(dt){ this.pos.add(this.vel.clone().scale(dt)); this.angle+=this.rotation*dt; wrap(this, canvas.width, canvas.height);} draw(){ ctx.save(); ctx.translate(this.pos.x,this.pos.y); ctx.rotate(this.angle); ctx.beginPath(); for(let i=0;i<this.shape.length;i++){ const p=this.shape[i]; if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);} ctx.closePath(); ctx.strokeStyle='#9fb1c3'; ctx.lineWidth=2; ctx.stroke(); ctx.restore(); } }
+
+  const particles={ list:[], thrust(ship){ const a=ship.angle+Math.PI+rand(-0.5,0.5); const speed=rand(0.05,0.12); this.list.push({ pos:ship.pos.clone(), vel:new Vec2(Math.cos(a)*speed, Math.sin(a)*speed), life:rand(150,300) }); }, boom(x,y,n=24){ for(let i=0;i<n;i++) this.list.push({ pos:new Vec2(x,y), vel:new Vec2(Math.cos(rand(0,TAU))*rand(0.03,0.2), Math.sin(rand(0,TAU))*rand(0.03,0.2)), life:rand(250,600) }); }, update(dt){ this.list.forEach(p=>{ p.pos.add(p.vel.clone().scale(dt)); p.life-=dt; }); this.list=this.list.filter(p=>p.life>0); }, draw(){ ctx.save(); ctx.globalCompositeOperation='lighter'; this.list.forEach(p=>{ ctx.globalAlpha=Math.max(p.life/600,0); ctx.fillStyle='#cde1ff'; ctx.fillRect(p.pos.x,p.pos.y,2,2); }); ctx.restore(); ctx.globalAlpha=1; } };
+
+  const input={ left:false, right:false, up:false, space:false };
+  addEventListener('keydown',(e)=>{
+    if(e.code==='ArrowLeft') input.left=true;
+    if(e.code==='ArrowRight') input.right=true;
+    if(e.code==='ArrowUp') input.up=true;
+    if(e.code==='Space'){ input.space=true; ensureAudio(); }
+    if(e.code==='Enter'){ ensureAudio(); if(!running) startGame(); }
+    if(e.code==='KeyM'){ muted=!muted; updateSoundTag(); }
+    if(e.code==='KeyI'){ ensureAudio(); tryInvincible(); }
+  });
+  addEventListener('keyup',(e)=>{
+    if(e.code==='ArrowLeft') input.left=false;
+    if(e.code==='ArrowRight') input.right=false;
+    if(e.code==='ArrowUp') input.up=false;
+    if(e.code==='Space') input.space=false;
+  });
+
+  // Spiltilstand
+  let ship, bullets, asteroids, score, lives, level, last, running=false;
+  // Invincibility cooldown
+  const INV_DURATION = 2000;      // 2s uovervindelig
+  const INV_COOLDOWN = 6000;      // 6s cooldown (kan justeres)
+  let invCooldown = 0;            // ms tilbage af cooldown
+
+  function spawnAsteroids(n){
+    const list=[]; for(let i=0;i<n;i++){ let x=Math.random()*canvas.width; let y=Math.random()*canvas.height; const dx=x-canvas.width/2, dy=y-canvas.height/2; if(Math.hypot(dx,dy)<160){ i--; continue; } list.push(new Asteroid(x,y,3)); } return list;
+  }
+
+  function startGame(){
+    ship=new Ship(); bullets=[]; level=1; score=0; invCooldown=0;
+    lives=currentDiff.lives; asteroids=spawnAsteroids(currentDiff.spawnStart);
+    updateUI(); centerMessage(''); running=true; last=perf.now(); loop();
+  }
+
+  function nextLevel(){ level++; asteroids=spawnAsteroids(currentDiff.spawnStart+(level-1)*currentDiff.spawnPerLevel); updateUI(); flashCenter(`Niveau ${level}`); sfx.level(); }
+
+  function updateUI(){
+    const html = `Score: ${score.toLocaleString('da-DK')} &nbsp; • &nbsp; Liv: <span id="lives">${lives}</span> &nbsp; • &nbsp; Niveau: <span id="level">${level}</span> &nbsp; • &nbsp; <span class="tag">Svær: <span id="diffTag">${currentDiffName}</span></span> &nbsp; • &nbsp; <span class="tag">Lyd: <span id="soundTag">${(!audioCtx||muted)?'Fra':'Til'}</span></span> &nbsp; • &nbsp; <span class="tag">I-cd: <span id="icdTag">${Math.max(0,Math.ceil(invCooldown/1000))}s</span></span>`;
+    scoreEl.innerHTML = html;
+  }
+
+  function centerMessage(html){ centerEl.innerHTML = html ? `<div class="panel">${html}</div>` : ''; }
+  function flashCenter(text){ centerMessage(`<strong>${text}</strong>`); setTimeout(()=>centerMessage(''), 900); }
+
+  function gameOver(){ running=false; sfx.over(); centerMessage(`<div style="font-size:22px;font-weight:700;margin-bottom:6px">Game Over</div><div class="muted" style="margin-bottom:10px">Score: ${score.toLocaleString('da-DK')}</div><div>Tryk <kbd>Enter</kbd> for at spille igen</div>`); }
+
+  function loop(){ if(!running) return; const now=perf.now(); let dt=now-last; if(dt>40) dt=40; last=now; update(dt); draw(); requestAnimationFrame(loop); }
+
+  function update(dt){
+    ship.update(dt, input);
+
+    // skydning
+    if(input.space && ship.canShoot()){ bullets.push(new Bullet(ship.pos.x+Math.cos(ship.angle)*14, ship.pos.y+Math.sin(ship.angle)*14, ship.angle)); ship.shoot(); sfx.shoot(); }
+
+    bullets.forEach(b=>b.update(dt)); bullets=bullets.filter(b=>b.alive());
+    asteroids.forEach(a=>a.update(dt));
+
+    // kollisioner: kugler ↔ asteroider
+    for(let i=bullets.length-1;i>=0;i--){
+      for(let j=asteroids.length-1;j>=0;j--){
+        const b=bullets[i], a=asteroids[j];
+        if(Math.hypot(b.pos.x-a.pos.x, b.pos.y-a.pos.y) < a.radius){
+          particles.boom(b.pos.x,b.pos.y,10+a.size*4); sfx.explode(a.size);
+          bullets.splice(i,1); asteroids.splice(j,1);
+          score += {3:20, 2:50, 1:100}[a.size];
+          if(a.size>1){ for(let k=0;k<2;k++){ const child=new Asteroid(a.pos.x,a.pos.y,a.size-1); child.vel = child.vel.add(new Vec2(rand(-0.03,0.03), rand(-0.03,0.03))); asteroids.push(child);} }
+          updateUI();
+          break;
+        }
+      }
+    }
+
+    // kollision: skib ↔ asteroide
+    if(ship.invincible<=0){
+      for(let j=asteroids.length-1;j>=0;j--){ const a=asteroids[j]; if(Math.hypot(ship.pos.x-a.pos.x, ship.pos.y-a.pos.y) < a.radius+ship.radius){ particles.boom(ship.pos.x,ship.pos.y,46); sfx.explode(2); lives--; updateUI(); ship = new Ship(); if(lives<=0){ gameOver(); } break; } }
+    }
+
+    // næste niveau
+    if(running && asteroids.length===0) nextLevel();
+
+    // cooldown timer
+    if(invCooldown>0){ invCooldown -= dt; if(invCooldown<0) invCooldown=0; }
+
+    particles.update(dt);
+  }
+
+  // RENDERING
+  function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.globalAlpha=0.4; for(let i=0;i<80;i++) ctx.fillRect((i*97)%canvas.width, (i*57)%canvas.height, 1, 1); ctx.globalAlpha=1;
+    ship.draw(); asteroids.forEach(a=>a.draw()); bullets.forEach(b=>b.draw()); particles.draw();
+  }
+
+  // Invincibility med cooldown
+  function tryInvincible(){
+    if(!running) return;
+    if(invCooldown>0){ flashCenter(`I-cooldown: ${Math.ceil(invCooldown/1000)}s`); return; }
+    ship.invincible = Math.max(ship.invincible||0, INV_DURATION);
+    invCooldown = INV_COOLDOWN;
+    sfx.inv(); updateUI(); flashCenter('Uovervindelig i 2s');
+  }
+
+  // Startmenu
+  function showMenu(){
+    const menu = `
+      <div style="font-size:22px;font-weight:700;margin-bottom:6px">Asteroids</div>
+      <div class="muted">Vælg sværhedsgrad og start</div>
+      <div class="btns" role="group" aria-label="Sværhedsgrad">
+        <button id="bEasy" aria-pressed="${currentDiffName==='Easy'}">Let</button>
+        <button id="bNormal" aria-pressed="${currentDiffName==='Normal'}">Normal</button>
+        <button id="bHard" aria-pressed="${currentDiffName==='Hard'}">Svær</button>
+      </div>
+      <div class="btns">
+        <button id="startBtn"><strong>Start (Enter)</strong></button>
+        <button id="soundBtn">Lyd: <span>${(!audioCtx || muted)?'Fra':'Til'}</span> (M)</button>
+      </div>
+      <div style="margin-top:8px" class="muted">Taster: ←/→ drej, ↑ thrust, Space skyd, I uovervindelig</div>`;
+    centerMessage(menu);
+    const byId = id => centerEl.querySelector('#'+id);
+    const setDiff = (name)=>{ currentDiffName=name; currentDiff=DIFFS[name]; diffTag.textContent=name; showMenu(); };
+    byId('bEasy').onclick = ()=> setDiff('Easy');
+    byId('bNormal').onclick = ()=> setDiff('Normal');
+    byId('bHard').onclick = ()=> setDiff('Hard');
+    byId('startBtn').onclick = ()=>{ ensureAudio(); startGame(); };
+    byId('soundBtn').onclick = ()=>{ ensureAudio(); muted=!muted; updateSoundTag(); showMenu(); };
+  }
+
+  // --- Selvtests (kører i konsollen) ---
+  (function selfTests(){
+    const tests=[]; const test=(name,fn)=>tests.push({name,fn}); const assert=(c,m)=>{ if(!c) throw new Error(m||'Assertion failed'); };
+    test('draw() findes', ()=>{ assert(typeof draw==='function','draw er ikke en funktion'); });
+    test('spawnAsteroids antal', ()=>{ const n=7; const arr=spawnAsteroids(n); assert(Array.isArray(arr)&&arr.length===n,'forkert antal'); });
+    test('Ship cooldown', ()=>{ const s=new Ship(); assert(s.canShoot(),'burde kunne skyde'); s.shoot(); assert(!s.canShoot(),'burde være i cooldown'); s.cooldown=0; assert(s.canShoot(),'cooldown nul burde kunne skyde'); });
+    test('I-cooldown logik', ()=>{ invCooldown=0; ship=new Ship(); running=true; tryInvincible(); assert(invCooldown===INV_COOLDOWN,'cd ikke sat'); const before=invCooldown; tryInvincible(); assert(invCooldown===before,'cd må ikke resette under cd'); running=false; });
+    // Nye tests for timing/polyfill
+    test('perf.now findes og returnerer tal', ()=>{ const t=perf.now(); assert(typeof t==='number','perf.now gav ikke tal'); });
+    test('perf.now er ikke-faldende', ()=>{ const a=perf.now(); const b=perf.now(); assert(b>=a,'perf.now faldt'); });
+    test('Ship starter i midten', ()=>{ const s=new Ship(); assert(Math.abs(s.pos.x - canvas.width/2) < 0.001 && Math.abs(s.pos.y - canvas.height/2) < 0.001, 'skib ikke i center'); });
+
+    let passed=0; tests.forEach(t=>{ try{ t.fn(); console.info('✅', t.name); passed++; } catch(e){ console.error('❌', t.name, e); } });
+    console.info(`Selvtests: ${passed}/${tests.length} bestået`);
+  })();
+
+  showMenu();
+})();
+</script>
+</body>
+</html>
